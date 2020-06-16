@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -20,8 +22,18 @@ var masterURL string
 var uploadURL string
 var id string
 
-const maxRetries = 3
-const waitingTime = 10
+const defaultMaxRetries = 3
+const defaultWaitingTime = 10
+
+// newClient is a function that returns customized http client
+func newClient(maxRetries int, waitingTime int) *http.Client {
+	clientretry := retryablehttp.NewClient()
+	clientretry.RetryMax = maxRetries
+	clientretry.RetryWaitMin = time.Duration(time.Duration(waitingTime) * time.Second)
+	clientretry.RetryWaitMax = time.Duration(time.Duration(waitingTime) * time.Second)
+
+	return clientretry.StandardClient()
+}
 
 // updateMasterURL is a function responsible for updating master node ip for future requests
 func updateMasterURL() {
@@ -33,12 +45,33 @@ func updateMasterURL() {
 
 // updateUploadURL is a function responsible for asking master node for data node upload url
 func updateUploadURL() error {
-
 	// send request to master node to get data node upload ip
 	// if success, set the new upload URL
 	// if fail, return error
+	client := newClient(defaultMaxRetries, defaultWaitingTime)
+	req, _ := http.NewRequest(http.MethodGet, masterURL, nil)
+	res, err := client.Do(req)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
 
-	uploadURL = "http://localhost:8080/upload"
+	defer res.Body.Close()
+
+	bodyBytes, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	body := string(bodyBytes)
+
+	if res.StatusCode != http.StatusOK {
+		log.Println(body)
+		return errors.New(body)
+	}
+
+	uploadURL = body
+	log.Println(fmt.Sprintf("Updated upload url to %s", uploadURL))
 	return nil
 }
 
@@ -61,12 +94,7 @@ func sendInitialRequest(filepath string) (string, error) {
 
 	filename := path.Base(filepath)
 
-	clientretry := retryablehttp.NewClient()
-	clientretry.RetryMax = maxRetries
-	clientretry.RetryWaitMin = time.Duration(waitingTime * time.Second)
-	clientretry.RetryWaitMax = time.Duration(waitingTime * time.Second)
-
-	client := clientretry.StandardClient()
+	client := newClient(defaultMaxRetries, defaultWaitingTime)
 	req, _ := http.NewRequest(http.MethodPost, uploadURL, nil)
 	req.Header.Set("Request-Type", "INIT")
 	req.Header.Set("Filename", filename)
@@ -137,17 +165,19 @@ func main() {
 
 	filepath := os.Args[1]
 
-	ticker := time.NewTicker(waitingTime * time.Second)
-	for trial := 0; trial <= maxRetries; trial, _ = trial+1, <-ticker.C {
+	ticker := time.NewTicker(defaultWaitingTime * time.Second)
+	for trial := 0; trial <= defaultMaxRetries; trial, _ = trial+1, <-ticker.C {
 		updateMasterURL()
 		err := updateUploadURL()
 		if err == nil {
 			continue
 		}
+
 		id, err := sendInitialRequest(filepath)
 		if err == nil {
 			continue
 		}
+
 		log.Println("Sent inital request with ID =", id)
 		err = uploadFile(filepath, id)
 		if err != nil {
