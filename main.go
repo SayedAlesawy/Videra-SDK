@@ -4,16 +4,45 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"path"
 	"strconv"
+	"time"
+
+	"github.com/hashicorp/go-retryablehttp"
 )
 
 const chunkSize = 4 << 20 // 4 MB
 
+var masterURL string
+var uploadURL string
+var id string
+
+const maxRetries = 3
+const waitingTime = 10
+
+// updateMasterURL is a function responsible for updating master node ip for future requests
+func updateMasterURL() {
+	// Should do master discovery by looping on nodes IPs in configuration file
+	// and when a node responds with the master IP, it'll be set in master URL
+
+	masterURL = ""
+}
+
+// updateUploadURL is a function responsible for asking master node for data node upload url
+func updateUploadURL() error {
+
+	// send request to master node to get data node upload ip
+	// if success, set the new upload URL
+	// if fail, return error
+
+	uploadURL = "http://localhost:8080/upload"
+	return nil
+}
+
+// getFileSize is a function to get file size
 func getFileSize(filepath string) (int64, error) {
 	fi, err := os.Stat(filepath)
 	if err != nil {
@@ -23,40 +52,46 @@ func getFileSize(filepath string) (int64, error) {
 	return fi.Size(), nil
 }
 
-func sendInitialRequest(filepath string, url string) string {
+// sendInitialRequest is a function responsible for starting upload process with data node
+func sendInitialRequest(filepath string) (string, error) {
 	fileSize, err := getFileSize(filepath)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	filename := path.Base(filepath)
-	fmt.Println(filename)
 
-	client := &http.Client{}
-	req, _ := http.NewRequest(http.MethodPost, url, nil)
+	clientretry := retryablehttp.NewClient()
+	clientretry.RetryMax = maxRetries
+	clientretry.RetryWaitMin = time.Duration(waitingTime * time.Second)
+	clientretry.RetryWaitMax = time.Duration(waitingTime * time.Second)
+
+	client := clientretry.StandardClient()
+	req, _ := http.NewRequest(http.MethodPost, uploadURL, nil)
 	req.Header.Set("Request-Type", "INIT")
 	req.Header.Set("Filename", filename)
 	req.Header.Set("Filesize", strconv.FormatInt(fileSize, 10))
 
-	// should be put in a loop to check connection error
 	res, err := client.Do(req)
 	if err != nil {
-		// some error should be returned to retry another node
-		log.Fatal(err)
+		log.Println(err)
+		return "", err
 	}
+
 	if res.StatusCode != http.StatusCreated {
 		log.Fatal(res.StatusCode)
 	}
 
 	id := res.Header.Get("ID")
-	return id
+	return id, nil
 }
 
-func uploadFile(filepath string, id string, url string) bool {
+// uploadFile is a function responsible for uploading file contents to data node
+func uploadFile(filepath string, id string) error {
 	file, err := os.Open(filepath)
 	if err != nil {
 		fmt.Println(err)
-		return false
+		return err
 	}
 	defer file.Close()
 
@@ -72,49 +107,53 @@ func uploadFile(filepath string, id string, url string) bool {
 			if err != io.EOF {
 				fmt.Println(err)
 			}
-
-			break
+			return err
 		}
 
 		r := bytes.NewReader(buffer[:bytesread])
 
-		req, _ := http.NewRequest(http.MethodPost, url, r)
+		req, _ := http.NewRequest(http.MethodPost, uploadURL, r)
 		req.Header.Set("Request-Type", "APPEND")
 		req.Header.Set("ID", id)
 		req.Header.Set("Offset", strconv.FormatInt(offset, 10))
 
 		res, err := client.Do(req)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		if res.StatusCode != http.StatusOK {
-			if res.StatusCode == http.StatusAccepted {
-				return true
+			if res.StatusCode == http.StatusCreated {
+				return nil
 			}
-			body, _ := ioutil.ReadAll(res.Body)
-			bodyString := string(body)
-
-			log.Fatal(bodyString)
+			// todo, handle chunk size and offset errors
+			return err
 		}
 		offset += int64(bytesread)
-		fmt.Println(res.Status)
+		log.Println(res.Status)
 	}
-
-	return false
 }
 
 func main() {
 
 	filepath := os.Args[1]
-	url := "http://localhost:8080/upload"
 
-	id := sendInitialRequest(filepath, url)
-	log.Println("Sent inital request with ID =", id)
-	state := uploadFile(filepath, id, url)
-	if !state {
-		log.Fatal("File not uploaded")
-	} else {
-		log.Println("File uploaded successfully")
+	ticker := time.NewTicker(waitingTime * time.Second)
+	for trial := 0; trial <= maxRetries; trial, _ = trial+1, <-ticker.C {
+		updateMasterURL()
+		err := updateUploadURL()
+		if err == nil {
+			continue
+		}
+		id, err := sendInitialRequest(filepath)
+		if err == nil {
+			continue
+		}
+		log.Println("Sent inital request with ID =", id)
+		err = uploadFile(filepath, id)
+		if err != nil {
+			log.Println("Upload successful")
+			return
+		}
 	}
-
+	log.Fatal("File not uploaded")
 }
