@@ -16,7 +16,7 @@ import (
 	"github.com/hashicorp/go-retryablehttp"
 )
 
-const chunkSize = 4 << 20 // 4 MB
+var chunkSize = int64(4 << 20) // 4 MB
 
 var masterURL string
 var uploadURL string
@@ -27,6 +27,7 @@ const defaultWaitingTime = 10
 
 var mastersURLS []string
 var lastUsedMaster = -1
+
 // newClient is a function that returns customized http client
 func newClient(maxRetries int, waitingTime int) *http.Client {
 	clientretry := retryablehttp.NewClient()
@@ -41,7 +42,7 @@ func newClient(maxRetries int, waitingTime int) *http.Client {
 func updateMasterURL() {
 	// Should do master discovery by looping on nodes IPs in configuration file
 	// and when a node responds with the master IP, it'll be set in master URL
-	lastUsedMaster=(lastUsedMaster+1)%len(mastersURLS)
+	lastUsedMaster = (lastUsedMaster + 1) % len(mastersURLS)
 	masterURL = mastersURLS[lastUsedMaster]
 }
 
@@ -113,6 +114,10 @@ func sendInitialRequest(filepath string) (string, error) {
 	}
 
 	id := res.Header.Get("ID")
+	if res.Header.Get("Max-Request-Size") != "" {
+		chunkSize, _ := strconv.ParseInt(res.Header.Get("Max-Request-Size"), 10, 64)
+		log.Println(fmt.Sprintf("Chunk size %v", chunkSize))
+	}
 	return id, nil
 }
 
@@ -149,13 +154,27 @@ func uploadFile(filepath string, id string) error {
 
 		res, err := client.Do(req)
 		if err != nil {
+			log.Println(err)
 			return err
 		}
 		if res.StatusCode != http.StatusOK {
 			if res.StatusCode == http.StatusCreated {
 				return nil
+			} else if res.Header.Get("Offset") != "" {
+				newOffset, _ := strconv.ParseInt(res.Header.Get("Offset"), 10, 64)
+				log.Println(fmt.Sprintf("Offset error: changing from %v to %v", offset, newOffset))
+				offset = newOffset
+				file.Seek(offset, 0)
+				continue
+			} else if res.Header.Get("Max-Request-Size") != "" {
+				newChunkSize, _ := strconv.ParseInt(res.Header.Get("Max-Request-Size"), 10, 64)
+				log.Println(fmt.Sprintf("Chunk size error: changing from %v to %v", chunkSize, newChunkSize))
+				chunkSize = newChunkSize
+				buffer = make([]byte, chunkSize)
+				file.Seek(offset, 0)
+				continue
 			}
-			// todo, handle chunk size and offset errors
+
 			return err
 		}
 		offset += int64(bytesread)
@@ -169,19 +188,23 @@ func main() {
 		log.Fatalln("Error parsing args\nArgs: filename master1 master2 ........")
 	}
 	filepath := os.Args[1]
-	mastersURLS = append(mastersURLS,os.Args[2:]...)
+	mastersURLS = append(mastersURLS, os.Args[2:]...)
 	ticker := time.NewTicker(defaultWaitingTime * time.Second)
 
 	updateMasterURL()
 	for trial := 0; trial <= defaultMaxRetries; trial, _ = trial+1, <-ticker.C {
 		err := updateUploadURL()
 		if err != nil {
+			log.Println("Can't contact master")
+			log.Println(err)
 			updateMasterURL()
 			continue
 		}
 
 		id, err := sendInitialRequest(filepath)
 		if err != nil {
+			log.Println("Can't connect to node")
+			log.Println(err)
 			continue
 		}
 
