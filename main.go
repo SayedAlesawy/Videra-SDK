@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"errors"
+	"flag"
 	"fmt"
+	"github.com/hashicorp/go-retryablehttp"
 	"io"
 	"io/ioutil"
 	"log"
@@ -12,8 +14,6 @@ import (
 	"path"
 	"strconv"
 	"time"
-	"flag"
-	"github.com/hashicorp/go-retryablehttp"
 )
 
 var chunkSize = int64(4 << 20) // 4 MB
@@ -116,7 +116,7 @@ func sendInitialRequest(filepath string, filetype string, extraHeaders map[strin
 
 	id := res.Header.Get("ID")
 	if res.Header.Get("Max-Request-Size") != "" {
-		chunkSize, _ := strconv.ParseInt(res.Header.Get("Max-Request-Size"), 10, 64)
+		chunkSize, _ = strconv.ParseInt(res.Header.Get("Max-Request-Size"), 10, 64)
 		log.Println(fmt.Sprintf("Chunk size %v", chunkSize))
 	}
 	return id, nil
@@ -166,9 +166,21 @@ func uploadFiles(id string, filesPaths map[string]string, uploadOrder []string) 
 
 	buffer := make([]byte, chunkSize)
 	offset := int64(0)
+	readOffset := int64(-1) //for re-reading file file content, in case of failure
 
-	for idx, fileName := range uploadOrder {
+	filesSizes := make([]int64, len(uploadOrder))
+	for idx := 0; idx < len(uploadOrder); idx++ {
+		fileName := uploadOrder[idx]
+		fileSize, _ := getFileSize(filesPaths[fileName])
+		filesSizes[idx] = fileSize
+	}
+	for idx := 0; idx < len(uploadOrder); idx++ {
+		fileName := uploadOrder[idx]
 		file, err := os.Open(filesPaths[fileName])
+		if readOffset != -1 {
+			file.Seek(readOffset, 0)
+		}
+		readOffset = -1
 		log.Println("Uploading", fileName, file.Name())
 		defer file.Close()
 		if err != nil {
@@ -181,7 +193,8 @@ func uploadFiles(id string, filesPaths map[string]string, uploadOrder []string) 
 
 			if err != nil {
 				if err == io.EOF {
-					if idx == len(modelUploadOrder)-1 {
+					if idx == len(uploadOrder)-1 {
+						log.Println(err)
 						// reached the end of last file, but didn't receive ack from server
 						return err
 					}
@@ -212,14 +225,39 @@ func uploadFiles(id string, filesPaths map[string]string, uploadOrder []string) 
 					newOffset, _ := strconv.ParseInt(res.Header.Get("Offset"), 10, 64)
 					log.Println(fmt.Sprintf("Offset error: changing from %v to %v", offset, newOffset))
 					offset = newOffset
-					file.Seek(offset, 0)
-					continue
+					uploadedFilesSize := int64(0)
+					readOffset = offset
+					foundNewIndex := false
+					// detect which file will be resumed upload at
+					for i, size := range filesSizes {
+						uploadedFilesSize += size
+						// the current file should be restarted at
+						if uploadedFilesSize > offset {
+							foundNewIndex = true
+							idx = i - 1 //subtracted 1 as outer loop will increment by 1
+							break
+						}
+						// subtract prev uploaded files sizes to get absolute offset at file
+						readOffset -= size
+					}
+					if !foundNewIndex {
+						if offset > uploadedFilesSize {
+							//Mismatch
+							return errors.New("an error has occured")
+						}
+
+						if offset == uploadedFilesSize {
+							//file upload was complete
+							return nil
+						}
+					}
+					break
 				} else if res.Header.Get("Max-Request-Size") != "" {
 					newChunkSize, _ := strconv.ParseInt(res.Header.Get("Max-Request-Size"), 10, 64)
 					log.Println(fmt.Sprintf("Chunk size error: changing from %v to %v", chunkSize, newChunkSize))
 					chunkSize = newChunkSize
 					buffer = make([]byte, chunkSize)
-					file.Seek(offset, 0)
+					file.Seek(-int64(bytesread), 1) //revert current read bytes, 1 means relative to current offset
 					continue
 				}
 
@@ -318,7 +356,7 @@ func main() {
 	}
 	mastersURLS = append(mastersURLS, flag.Args()...)
 	updateMasterURL()
-	
+
 	switch *mode {
 	case "model":
 		if *modelPath == "" {
