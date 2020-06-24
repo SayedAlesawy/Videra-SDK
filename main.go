@@ -12,7 +12,7 @@ import (
 	"path"
 	"strconv"
 	"time"
-
+	"flag"
 	"github.com/hashicorp/go-retryablehttp"
 )
 
@@ -27,6 +27,8 @@ const defaultWaitingTime = 10
 
 var mastersURLS []string
 var lastUsedMaster = -1
+
+var modelUploadOrder = []string{"model", "config", "code"}
 
 // newClient is a function that returns customized http client
 func newClient(maxRetries int, waitingTime int) *http.Client {
@@ -89,20 +91,19 @@ func getFileSize(filepath string) (int64, error) {
 }
 
 // sendInitialRequest is a function responsible for starting upload process with data node
-func sendInitialRequest(filepath string) (string, error) {
-	fileSize, err := getFileSize(filepath)
-	if err != nil {
-		log.Fatal(err)
-	}
-
+// default set headers are filename and filetype
+func sendInitialRequest(filepath string, filetype string, extraHeaders map[string]string) (string, error) {
 	filename := path.Base(filepath)
 
 	client := newClient(defaultMaxRetries, defaultWaitingTime)
 	req, _ := http.NewRequest(http.MethodPost, uploadURL, nil)
-	req.Header.Set("Request-Type", "INIT")
+	req.Header.Set("Request-Type", "init")
 	req.Header.Set("Filename", filename)
-	req.Header.Set("Filesize", strconv.FormatInt(fileSize, 10))
+	req.Header.Set("Filetype", filetype)
 
+	for key, val := range extraHeaders {
+		req.Header.Set(key, val)
+	}
 	res, err := client.Do(req)
 	if err != nil {
 		log.Println(err)
@@ -121,77 +122,121 @@ func sendInitialRequest(filepath string) (string, error) {
 	return id, nil
 }
 
-// uploadFile is a function responsible for uploading file contents to data node
-func uploadFile(filepath string, id string) error {
-	file, err := os.Open(filepath)
+// sendVideoInitialRequest is a function responsible for sending initial upload request for video
+func sendVideoInitialRequest(videoPath string) (string, error) {
+	videoSize, err := getFileSize(videoPath)
 	if err != nil {
-		fmt.Println(err)
-		return err
+		log.Fatal(err)
 	}
-	defer file.Close()
 
-	client := &http.Client{}
+	headers := map[string]string{
+		"Filesize": fmt.Sprintf("%v", videoSize),
+	}
+	return sendInitialRequest(videoPath, "video", headers)
+}
+
+// sendModelInitialRequest is a function responsible for sending initial upload request for model
+func sendModelInitialRequest(modelPath string, configPath string, codePath string) (string, error) {
+	modelSize, err := getFileSize(modelPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	configSize, err := getFileSize(configPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	codeSize, err := getFileSize(codePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	headers := map[string]string{
+		"Filesize":    fmt.Sprintf("%v", modelSize+configSize+codeSize),
+		"Model-Size":  fmt.Sprintf("%v", modelSize),
+		"Config-Size": fmt.Sprintf("%v", configSize),
+		"Code-Size":   fmt.Sprintf("%v", codeSize),
+	}
+
+	return sendInitialRequest(modelPath, "model", headers)
+}
+
+// uploadFiles is a function responsible for uploading files contents to data node
+func uploadFiles(id string, filesPaths map[string]string, uploadOrder []string) error {
+	client := newClient(defaultMaxRetries, defaultWaitingTime)
 
 	buffer := make([]byte, chunkSize)
 	offset := int64(0)
 
-	for {
-		bytesread, err := file.Read(buffer)
-
+	for idx, fileName := range uploadOrder {
+		file, err := os.Open(filesPaths[fileName])
+		log.Println("Uploading", fileName, file.Name())
+		defer file.Close()
 		if err != nil {
-			if err != io.EOF {
-				fmt.Println(err)
-			}
+			fmt.Println(err)
 			return err
 		}
 
-		r := bytes.NewReader(buffer[:bytesread])
+		for {
+			bytesread, err := file.Read(buffer)
 
-		req, _ := http.NewRequest(http.MethodPost, uploadURL, r)
-		req.Header.Set("Request-Type", "APPEND")
-		req.Header.Set("ID", id)
-		req.Header.Set("Offset", strconv.FormatInt(offset, 10))
-
-		res, err := client.Do(req)
-		if err != nil {
-			log.Println(err)
-			return err
-		}
-		if res.StatusCode != http.StatusOK {
-			if res.StatusCode == http.StatusCreated {
-				return nil
-			} else if res.Header.Get("Offset") != "" {
-				newOffset, _ := strconv.ParseInt(res.Header.Get("Offset"), 10, 64)
-				log.Println(fmt.Sprintf("Offset error: changing from %v to %v", offset, newOffset))
-				offset = newOffset
-				file.Seek(offset, 0)
-				continue
-			} else if res.Header.Get("Max-Request-Size") != "" {
-				newChunkSize, _ := strconv.ParseInt(res.Header.Get("Max-Request-Size"), 10, 64)
-				log.Println(fmt.Sprintf("Chunk size error: changing from %v to %v", chunkSize, newChunkSize))
-				chunkSize = newChunkSize
-				buffer = make([]byte, chunkSize)
-				file.Seek(offset, 0)
-				continue
+			if err != nil {
+				if err == io.EOF {
+					if idx == len(modelUploadOrder)-1 {
+						// reached the end of last file, but didn't receive ack from server
+						return err
+					}
+					// finished current file
+					file.Close()
+					break
+				}
+				return err
 			}
 
-			return err
+			r := bytes.NewReader(buffer[:bytesread])
+
+			req, _ := http.NewRequest(http.MethodPost, uploadURL, r)
+			req.Header.Set("Request-Type", "APPEND")
+			req.Header.Set("ID", id)
+			req.Header.Set("Offset", strconv.FormatInt(offset, 10))
+
+			res, err := client.Do(req)
+			if err != nil {
+				log.Println(err)
+				return err
+			}
+			if res.StatusCode != http.StatusOK {
+				if res.StatusCode == http.StatusCreated {
+					file.Close()
+					return nil
+				} else if res.Header.Get("Offset") != "" {
+					newOffset, _ := strconv.ParseInt(res.Header.Get("Offset"), 10, 64)
+					log.Println(fmt.Sprintf("Offset error: changing from %v to %v", offset, newOffset))
+					offset = newOffset
+					file.Seek(offset, 0)
+					continue
+				} else if res.Header.Get("Max-Request-Size") != "" {
+					newChunkSize, _ := strconv.ParseInt(res.Header.Get("Max-Request-Size"), 10, 64)
+					log.Println(fmt.Sprintf("Chunk size error: changing from %v to %v", chunkSize, newChunkSize))
+					chunkSize = newChunkSize
+					buffer = make([]byte, chunkSize)
+					file.Seek(offset, 0)
+					continue
+				}
+
+				return err
+			}
+			offset += int64(bytesread)
+			log.Println(res.Status)
 		}
-		offset += int64(bytesread)
-		log.Println(res.Status)
 	}
+
+	return nil
 }
 
-func main() {
-
-	if len(os.Args) < 3 {
-		log.Fatalln("Error parsing args\nArgs: filename master1 master2 ........")
-	}
-	filepath := os.Args[1]
-	mastersURLS = append(mastersURLS, os.Args[2:]...)
+// UploadVideo is a function responsible for uploading video
+func UploadVideo(videoPath string) {
 	ticker := time.NewTicker(defaultWaitingTime * time.Second)
 
-	updateMasterURL()
 	for trial := 0; trial <= defaultMaxRetries; trial, _ = trial+1, <-ticker.C {
 		err := updateUploadURL()
 		if err != nil {
@@ -201,7 +246,7 @@ func main() {
 			continue
 		}
 
-		id, err := sendInitialRequest(filepath)
+		id, err := sendVideoInitialRequest(videoPath)
 		if err != nil {
 			log.Println("Can't connect to node")
 			log.Println(err)
@@ -209,11 +254,90 @@ func main() {
 		}
 
 		log.Println("Sent inital request with ID =", id)
-		err = uploadFile(filepath, id)
+		videoPathMap := map[string]string{
+			"video": videoPath,
+		}
+
+		err = uploadFiles(id, videoPathMap, []string{"video"})
 		if err == nil {
 			log.Println("Upload successful")
 			return
 		}
 	}
 	log.Fatal("File not uploaded")
+}
+
+// UploadModel is a function responsible for uploading model
+func UploadModel(modelPath string, configPath string, codePath string) {
+	ticker := time.NewTicker(defaultWaitingTime * time.Second)
+
+	for trial := 0; trial <= defaultMaxRetries; trial, _ = trial+1, <-ticker.C {
+		err := updateUploadURL()
+		if err != nil {
+			log.Println("Can't contact master")
+			log.Println(err)
+			updateMasterURL()
+			continue
+		}
+
+		modelID, err := sendModelInitialRequest(modelPath, configPath, codePath)
+		if err != nil {
+			log.Println("Can't connect to node")
+			log.Println(err)
+			continue
+		}
+
+		log.Println("Sent inital request for model with ID =", modelID)
+		uploadFilesPaths := map[string]string{
+			"model":  modelPath,
+			"config": configPath,
+			"code":   codePath,
+		}
+		err = uploadFiles(modelID, uploadFilesPaths, modelUploadOrder)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		log.Println("Upload successful")
+		return
+	}
+	log.Fatal("File not uploaded")
+}
+
+func main() {
+	mode := flag.String("mode", "", "Mode of operatoin (video/model)")
+	videoPath := flag.String("video", "", "Path to video file")
+	modelPath := flag.String("model", "", "Path to model file")
+	configPath := flag.String("config", "", "Path to config file")
+	codePath := flag.String("code", "", "Path to code file")
+	flag.Parse()
+
+	if len(flag.Args()) == 0 {
+		log.Fatal("No masters ip provided")
+	}
+	mastersURLS = append(mastersURLS, flag.Args()...)
+	updateMasterURL()
+	
+	switch *mode {
+	case "model":
+		if *modelPath == "" {
+			log.Fatal("model flag wasn't provided")
+		}
+		if *configPath == "" {
+			log.Fatal("config flag wasn't provided")
+		}
+		if *codePath == "" {
+			log.Fatal("code flag wasn't provided")
+		}
+		UploadModel(*modelPath, *configPath, *codePath)
+	case "video":
+		if *videoPath == "" {
+			log.Fatal("video flag wasn't provided")
+		}
+		UploadVideo(*videoPath)
+	default:
+		log.Fatal("Invalid mode")
+	}
+
 }
