@@ -140,14 +140,15 @@ func (sdk VideraSDK) sendInitialRequest(filepath string, filetype string, extraH
 }
 
 // sendVideoInitialRequest is a function responsible for sending initial upload request for video
-func (sdk VideraSDK) sendVideoInitialRequest(videoPath string) (string, error) {
+func (sdk VideraSDK) sendVideoInitialRequest(videoPath string, associatedModelID string) (string, error) {
 	videoSize, err := getFileSize(videoPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	headers := map[string]string{
-		"Filesize": fmt.Sprintf("%v", videoSize),
+		"Filesize":            fmt.Sprintf("%v", videoSize),
+		"Associated-Model-ID": associatedModelID,
 	}
 	return sdk.sendInitialRequest(videoPath, "video", headers)
 }
@@ -302,7 +303,7 @@ func getFileFromOffset(filesSizes []int64, offset int64) (int, int64, error) {
 }
 
 // UploadVideo is a function responsible for uploading video
-func (sdk VideraSDK) UploadVideo(videoPath string) {
+func (sdk VideraSDK) UploadVideo(videoPath string, associatedModelID string) {
 	ticker := time.NewTicker(time.Duration(sdk.defaultWaitingTime) * time.Second)
 
 	for trial := 0; trial <= sdk.defaultMaxRetries; trial, _ = trial+1, <-ticker.C {
@@ -313,7 +314,7 @@ func (sdk VideraSDK) UploadVideo(videoPath string) {
 			continue
 		}
 
-		id, err := sdk.sendVideoInitialRequest(videoPath)
+		id, err := sdk.sendVideoInitialRequest(videoPath, associatedModelID)
 		if err != nil {
 			log.Println("Can't connect to node")
 			log.Println(err)
@@ -366,6 +367,63 @@ func (sdk VideraSDK) UploadModel(modelPath string, configPath string, codePath s
 		}
 
 		log.Println("Upload successful")
+		return
+	}
+	log.Fatal("File not uploaded")
+}
+
+// UploadJob is a function responsible for uploading a model and a video into videra system
+func (sdk VideraSDK) UploadJob(videoPath string, modelPath string, configPath string, codePath string) {
+	ticker := time.NewTicker(time.Duration(sdk.defaultWaitingTime) * time.Second)
+
+	for trial := 0; trial <= sdk.defaultMaxRetries; trial, _ = trial+1, <-ticker.C {
+		err := sdk.updateUploadURL()
+		if err != nil {
+			log.Println("Can't contact master")
+			log.Println(err)
+			continue
+		}
+
+		modelID, err := sdk.sendModelInitialRequest(modelPath, configPath, codePath)
+		if err != nil {
+			log.Println("Can't connect to node")
+			log.Println(err)
+			continue
+		}
+
+		log.Println("Sent inital request for model with ID =", modelID)
+		uploadFilesPaths := map[string]string{
+			"model":  modelPath,
+			"config": configPath,
+			"code":   codePath,
+		}
+		err = sdk.uploadFiles(modelID, uploadFilesPaths, modelUploadOrder)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		log.Println("Upload Model successful")
+
+		videoID, err := sdk.sendVideoInitialRequest(videoPath, modelID)
+		if err != nil {
+			log.Println("Can't connect to node")
+			log.Println(err)
+			continue
+		}
+
+		log.Println("Sent inital request with ID =", videoID)
+		videoPathMap := map[string]string{
+			"video": videoPath,
+		}
+
+		err = sdk.uploadFiles(videoID, videoPathMap, []string{"video"})
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		log.Println("Video was upload successfully")
 		return
 	}
 	log.Fatal("File not uploaded")

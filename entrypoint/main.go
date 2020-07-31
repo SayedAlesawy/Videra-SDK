@@ -20,6 +20,5 @@ func main() {
 
 	masterURL := flag.Args()[0]
 	vSDK := viderasdk.SDKInstance(masterURL)
-	vSDK.UploadModel(*modelPath, *configPath, *codePath)
-	vSDK.UploadVideo(*videoPath)
+	vSDK.UploadJob(*videoPath, *modelPath, *configPath, *codePath)
 }
