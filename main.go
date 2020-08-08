@@ -2,9 +2,9 @@ package main
 
 import (
 	"flag"
-	"log"
 
 	viderasdk "github.com/SayedAlesawy/Videra-SDK/sdk"
+	"github.com/SayedAlesawy/Videra-SDK/utils"
 )
 
 func main() {
@@ -14,11 +14,13 @@ func main() {
 	codePath := flag.String("code", "", "Path to code file")
 	flag.Parse()
 
-	if len(flag.Args()) == 0 {
-		log.Fatal("No master ip provided")
+	flags := []string{*videoPath, *modelPath, *configPath, *codePath}
+	err := utils.ValidateFlags(flags...)
+	if err != nil {
+		flag.PrintDefaults()
+		return
 	}
 
-	masterURL := flag.Args()[0]
-	vSDK := viderasdk.SDKInstance(masterURL)
+	vSDK := viderasdk.SDKInstance()
 	vSDK.UploadJob(*videoPath, *modelPath, *configPath, *codePath)
 }

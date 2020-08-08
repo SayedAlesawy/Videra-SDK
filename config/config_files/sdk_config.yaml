@@ -1,0 +1,4 @@
+name_node_endpoint: 'http://localhost:8080/upload'
+chunk_size: 4194304 # 4 MB
+max_retries: 3
+waiting_time: 10

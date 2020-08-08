@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SayedAlesawy/Videra-SDK/config"
 	"github.com/hashicorp/go-retryablehttp"
 )
 
@@ -35,14 +36,17 @@ var sdkOnce sync.Once
 var sdkInstance *VideraSDK
 
 // SDKInstance A function to return a singleton server instance
-func SDKInstance(masterURL string) *VideraSDK {
+func SDKInstance() *VideraSDK {
 
 	sdkOnce.Do(func() {
+		configManager := config.ConfigurationManagerInstance("config/config_files")
+		configObj := configManager.SDKConfig("sdk_config.yaml")
+
 		sdk := VideraSDK{
-			masterURL:          masterURL,
-			chunkSize:          int64(4 << 20),
-			defaultMaxRetries:  3,
-			defaultWaitingTime: 10,
+			masterURL:          configObj.NameNodeEndpoint,
+			chunkSize:          configObj.ChunkSize,
+			defaultMaxRetries:  configObj.MaxRetries,
+			defaultWaitingTime: configObj.WaitingTime,
 		}
 
 		sdkInstance = &sdk
