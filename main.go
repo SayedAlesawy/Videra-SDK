@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"log"
 
 	viderasdk "github.com/SayedAlesawy/Videra-SDK/sdk"
 	"github.com/SayedAlesawy/Videra-SDK/utils"
@@ -22,5 +23,10 @@ func main() {
 	}
 
 	vSDK := viderasdk.SDKInstance()
-	vSDK.UploadJob(*videoPath, *modelPath, *configPath, *codePath)
+	err = vSDK.UploadJob(*videoPath, *modelPath, *configPath, *codePath)
+	if err != nil {
+		log.Println("Job submitted successfully!")
+	} else {
+		log.Println("An error has occured, please try again later.")
+	}
 }
