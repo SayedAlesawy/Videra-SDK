@@ -24,7 +24,7 @@ func main() {
 
 	vSDK := viderasdk.SDKInstance()
 	err = vSDK.UploadJob(*videoPath, *modelPath, *configPath, *codePath)
-	if err != nil {
+	if err == nil {
 		log.Println("Job submitted successfully!")
 	} else {
 		log.Println("An error has occured, please try again later.")
